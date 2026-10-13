@@ -23,15 +23,18 @@ import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
 import com.google.ar.core.Anchor
 import com.google.ar.core.Config
+import com.google.ar.core.Frame
 import com.google.ar.core.Plane
-import com.google.ar.core.TrackingState
+import io.github.sceneview.SceneView
 import io.github.sceneview.ar.ARSceneView
-import io.github.sceneview.ar.rememberARCameraNode
 import io.github.sceneview.math.Position
+import io.github.sceneview.model.engine
 import io.github.sceneview.node.ModelNode
+import io.github.sceneview.node.Node
 import io.github.sceneview.rememberEngine
 import io.github.sceneview.rememberModelInstance
 import io.github.sceneview.rememberModelLoader
+import io.github.sceneview.rememberNode
 import io.github.sceneview.rememberOnGestureListener
 
 class MainActivity : ComponentActivity() {
@@ -62,76 +65,63 @@ class MainActivity : ComponentActivity() {
 fun ARScreen() {
     val engine = rememberEngine()
     val modelLoader = rememberModelLoader(engine)
-    val cubeInstance = rememberModelInstance(modelLoader, "models/cube.glb")
-
     val placedAnchors = remember { mutableStateListOf<Anchor>() }
-
-    // Hold the tap event until the next onSessionUpdated, where we hit-test with a fresh frame.
-    var pendingTap by remember { mutableStateOf<MotionEvent?>(null) }
+    var latestFrame by remember { mutableStateOf<Frame?>(null) }
+    var physicsTargetNode by remember { mutableStateOf<Node?>(null) }
 
     ARSceneView(
         modifier = Modifier.fillMaxSize(),
         engine = engine,
-        cameraNode = rememberARCameraNode(engine),
-        planeRenderer = true,
-        sessionConfiguration = { session, config ->
-            config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
-            config.focusMode = Config.FocusMode.AUTO
+        modelLoader = modelLoader,
+        planeRenderer = true,                // show detected planes
+        sessionConfiguration = { _, config ->
+            config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
             config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
-
-            // Only enable depth when the session truly reports support.
-            config.depthMode =
-                if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
-                    Config.DepthMode.AUTOMATIC
-                } else {
-                    Config.DepthMode.DISABLED
-                }
-
-            // UpdateMode.BLOCKING intentionally NOT set — it's deprecated and
-            // causes stale frames + IMU/pose-pipeline stalls.
+            config.depthMode = Config.DepthMode.AUTOMATIC
         },
-
         onSessionUpdated = { _, frame ->
-            // Consume any pending tap NOW, while the frame is guaranteed fresh.
-            val tapEvent = pendingTap ?: return@ARSceneView
-            pendingTap = null
-
-            try {
-                if (frame.camera.trackingState != TrackingState.TRACKING) return@ARSceneView
-
-                val hit = frame.hitTest(tapEvent)
-                    .firstOrNull { result ->
-                        val trackable = result.trackable
-                        trackable is Plane &&
-                                trackable.trackingState == TrackingState.TRACKING &&
-                                trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                                trackable.isPoseInPolygon(result.hitPose)
-                    }
-
-                hit?.let { placedAnchors.add(it.createAnchor()) }
-            } finally {
-                tapEvent.recycle()
-            }
+            latestFrame = frame
         },
-
         onGestureListener = rememberOnGestureListener(
             onSingleTapConfirmed = { event, _ ->
-                // Do NOT hit-test here. Just stash a copy of the event.
-                pendingTap?.recycle()
-                pendingTap = MotionEvent.obtain(event)
+                val frame = latestFrame ?: return@rememberOnGestureListener
+
+                // Hit-test against a horizontal plane inside its polygon
+                val hit = frame.hitTest(event).firstOrNull { result ->
+                    val trackable = result.trackable
+                    trackable is Plane &&
+                            trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                            trackable.isPoseInPolygon(result.hitPose)
+                }
+
+                hit?.createAnchor()?.let { placedAnchors.add(it) }
             }
         )
     ) {
         placedAnchors.forEach { anchor ->
+
             key(anchor) {
                 AnchorNode(anchor = anchor) {
-                    cubeInstance?.let { instance ->
+                    val cubeInstance = rememberModelInstance(modelLoader, "models/cube.glb")
+                    cubeInstance?.let {
+                        var modelNode by remember { mutableStateOf<Node?>(null) }
                         ModelNode(
-                            modelInstance = instance,
-                            scaleToUnits = 0.2f,
-                            position = Position(0f, 0.1f, 0f),
+                            modelInstance = it,
+                            scaleToUnits = .1f,
+                            position = Position(0f, 1f, 0f),
+                            apply = { modelNode = this },
                             isEditable = true
                         )
+
+                        modelNode?.let { node ->
+                            this@AnchorNode.PhysicsNode(
+                                node = node,
+                                restitution = .7f,
+                                linearVelocity = Position(0f, 0f, 0f),
+                                floorY = 0f,
+                                radius = 0.1f
+                            )
+                        }
                     }
                 }
             }
