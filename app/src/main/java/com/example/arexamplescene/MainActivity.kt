@@ -16,7 +16,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import com.example.arexamplescene.ui.theme.ArExampleSceneTheme
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
@@ -29,11 +28,21 @@ import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.ar.arcore.isTracking
 import io.github.sceneview.math.Position
 import io.github.sceneview.node.Node
+import io.github.sceneview.rememberCollisionSystem
 import io.github.sceneview.rememberEngine
 import io.github.sceneview.rememberModelInstance
 import io.github.sceneview.rememberModelLoader
 import io.github.sceneview.rememberOnGestureListener
-import kotlin.math.hypot
+import io.github.sceneview.rememberView
+
+/** How far in front of the camera (metres) the selected object floats. */
+private const val FOLLOW_DISTANCE_M = 0.6f
+
+/** Light blue (#87CEFA) used by the "selected" material. */
+private val SELECTED_COLOR = floatArrayOf(0.53f, 0.81f, 0.98f)
+
+/** Original glTF base colour factor — white means "as authored". */
+private val DEFAULT_COLOR = floatArrayOf(1f, 1f, 1f)
 
 class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalPermissionsApi::class)
@@ -59,9 +68,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** Touch slop in pixels — below this we treat the gesture as a tap. */
-private const val DRAG_SLOP_PX = 12f
-
 @Composable
 fun ARScreen() {
     val engine = rememberEngine()
@@ -69,17 +75,16 @@ fun ARScreen() {
     val placedAnchors = remember { mutableStateListOf<Anchor>() }
     var latestFrame by remember { mutableStateOf<Frame?>(null) }
 
-    // ---- Drag state -------------------------------------------------------
-    var draggedNode by remember { mutableStateOf<Node?>(null) }
-    var dragStartTouch by remember { mutableStateOf(Offset.Zero) }
-    var isDragging by remember { mutableStateOf(false) }
-    var suppressNextTap by remember { mutableStateOf(false) }
-    // -----------------------------------------------------------------------
+    // The node currently attached to the camera (null = nothing selected).
+    var selectedNode by remember { mutableStateOf<Node?>(null) }
+    val view = rememberView(engine)
+    val collisionSystem = rememberCollisionSystem(view)
 
     ARSceneView(
         modifier = Modifier.fillMaxSize(),
         engine = engine,
         modelLoader = modelLoader,
+        collisionSystem = collisionSystem,
         planeRenderer = true,
         sessionConfiguration = { _, config ->
             config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
@@ -88,52 +93,34 @@ fun ARScreen() {
         },
         onSessionUpdated = { _, frame ->
             latestFrame = frame
+
+            // ---- Keep the selected object glued in front of the camera ----
+            selectedNode?.let { node ->
+                val cameraPose = frame.camera.pose
+                val translation = cameraPose.translation
+                // ARCore cameras look down their own -Z axis.
+                val forward = cameraPose.rotateVector(floatArrayOf(0f, 0f, -1f))
+
+                node.worldPosition = Position(
+                    translation[0] + forward[0] * FOLLOW_DISTANCE_M,
+                    translation[1] + forward[1] * FOLLOW_DISTANCE_M,
+                    translation[2] + forward[2] * FOLLOW_DISTANCE_M
+                )
+            }
         },
         onGestureListener = rememberOnGestureListener(
-            onDown = { event, node ->
-                draggedNode = node?.takeIf { it.isEditable }
-                dragStartTouch = Offset(event.x, event.y)
-                isDragging = false
-            },
-
-            onMove = { _, event, _ ->
-                val node = draggedNode ?: return@rememberOnGestureListener
-                val frame = latestFrame ?: return@rememberOnGestureListener
-
-                if (!isDragging) {
-                    val dx = event.x - dragStartTouch.x
-                    val dy = event.y - dragStartTouch.y
-                    if (hypot(dx, dy) < DRAG_SLOP_PX) {
-                        return@rememberOnGestureListener
-                    }
-                    isDragging = true
-                    suppressNextTap = true   // <-- arm the suppressor
-                }
-
-                frame.hitTest(event)
-                    .firstOrNull { it.trackable.isTracking }
-                    ?.let { hit ->
-                        val pose = hit.hitPose
-                        node.worldPosition = Position(pose.tx(), pose.ty() + 0.01f, pose.tz())
-                    }
-            },
-
             onSingleTapConfirmed = { event, node ->
-                // 1) If we just finished a drag, swallow this tap.
-                if (suppressNextTap) {
-                    suppressNextTap = false
-                    draggedNode = null
-                    isDragging = false
-                    return@rememberOnGestureListener
-                }
-
-                // 2) Only spawn when the tap is on empty space.
-                if (node == null) {
+                if (node != null) {
+                    // Tap on an object → select it (tap again to release it).
+                    selectedNode = if (selectedNode === node) null else node
+                } else {
+                    // Tap on empty space → place a new object on the floor.
                     val frame = latestFrame ?: return@rememberOnGestureListener
 
                     val hit = frame.hitTest(event).firstOrNull { result ->
                         val trackable = result.trackable
-                        trackable is Plane &&
+                        trackable.isTracking &&
+                                trackable is Plane &&
                                 trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
                                 trackable.isPoseInPolygon(result.hitPose)
                     }
@@ -147,29 +134,43 @@ fun ARScreen() {
             key(anchor) {
                 AnchorNode(anchor = anchor) {
                     val cubeInstance = rememberModelInstance(modelLoader, "models/cube.glb")
-                    cubeInstance?.let {
+                    cubeInstance?.let { instance ->
                         var modelNode by remember { mutableStateOf<Node?>(null) }
+                        val isSelected = modelNode != null && selectedNode === modelNode
+
                         ModelNode(
-                            modelInstance = it,
+                            modelInstance = instance,
                             scaleToUnits = .1f,
                             position = Position(0f, 1f, 0f),
                             apply = { modelNode = this },
-                            isEditable = true
+                            isEditable = true,
                         )
-                        if (draggedNode != modelNode) {
-                            modelNode?.let { node ->
-                                this@AnchorNode.PhysicsNode(
-                                    node = node,
-                                    restitution = .7f,
-                                    linearVelocity = Position(0f, 0f, 0f),
-                                    floorY = 0f,
-                                    radius = 0.1f
-                                )
+
+                        // ---- Swap the material colour while selected ----------
+                        LaunchedEffect(instance, isSelected) {
+                            val color = if (isSelected) SELECTED_COLOR else DEFAULT_COLOR
+                            instance.materialInstances.forEach { materialInstance ->
+                                val material = materialInstance.material
+                                // glTF PBR materials expose their colour as
+                                // `baseColorFactor`; skip materials that don't.
+                                if (material.hasParameter("baseColorFactor")) {
+                                    materialInstance.setParameter(
+                                        "baseColorFactor",
+                                        color[0], color[1], color[2], 1f
+                                    )
+                                }
                             }
                         }
-                        // If you add a PhysicsNode here, disable/remove it while
-                        // `draggedNode == modelNode`, otherwise the physics body
-                        // will fight the drag and snap the model back every frame.
+
+                        if (modelNode != null && !isSelected) {
+                            PhysicsNode(
+                                node = modelNode!!,
+                                restitution = .7f,
+                                linearVelocity = Position(0f, 0f, 0f),
+                                floorY = 0f,
+                                radius = 0.1f,
+                            )
+                        }
                     }
                 }
             }
