@@ -77,14 +77,11 @@ fun ARScreen() {
 
     // The node currently attached to the camera (null = nothing selected).
     var selectedNode by remember { mutableStateOf<Node?>(null) }
-    val view = rememberView(engine)
-    val collisionSystem = rememberCollisionSystem(view)
 
     ARSceneView(
         modifier = Modifier.fillMaxSize(),
         engine = engine,
         modelLoader = modelLoader,
-        collisionSystem = collisionSystem,
         planeRenderer = true,
         sessionConfiguration = { _, config ->
             config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
